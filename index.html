@@ -362,14 +362,13 @@
             '225': { rows: 15, cols: 15, name: '225 (15x15)' },
         };
 
-        let currentPlayersCount = 0;
+        // Global State
         let currentLayoutKey = '16';
         let customSpans = {};
         let selectedCellId = null;
+        const tracks = new Map(); // Map<id, Track>
 
-        const players = new Map();
-        const loops = new Map();
-        let inputCache = [];
+        // --- Utility Functions ---
 
         function parseTime(str) {
             if (!str) return 0;
@@ -382,17 +381,206 @@
             }
         }
 
+        // Improved URL Parser (Review #3)
         function extractVideoId(url) {
             if (!url) return null;
-            const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
-            const match = url.match(regExp);
-            return (match && match[2].length === 11) ? match[2] : null;
+            try {
+                // Handle incomplete URLs by adding protocol if missing
+                if (!url.startsWith('http')) {
+                    if (url.length === 11) return url; // Assume it's an ID
+                    url = 'https://' + url;
+                }
+
+                const urlObj = new URL(url);
+                if (urlObj.hostname === 'youtu.be') return urlObj.pathname.slice(1);
+                if (urlObj.pathname.includes('/shorts/')) return urlObj.pathname.split('/')[2];
+                if (urlObj.hostname.includes('youtube.com')) {
+                    return urlObj.searchParams.get('v');
+                }
+                return null;
+            } catch (e) {
+                console.warn('URL Parse Error:', e);
+                // Fallback to regex if URL parsing fails
+                const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
+                const match = url.match(regExp);
+                return (match && match[2].length === 11) ? match[2] : null;
+            }
         }
+
+        // --- Track Class (Review #5, #1, #2, #4) ---
+        class Track {
+            constructor(id, controls) {
+                this.id = id;
+                this.controls = controls; // UI elements references
+                this.player = null;
+                this.videoId = null;
+                this.rafId = null;
+                this.isMonitoring = false;
+
+                // Bind methods
+                this.loopMonitor = this.loopMonitor.bind(this);
+                this.onPlayerStateChange = this.onPlayerStateChange.bind(this);
+                this.onPlayerReady = this.onPlayerReady.bind(this);
+            }
+
+            loadVideo(videoId) {
+                if (this.player) {
+                    this.destroyPlayer();
+                }
+                this.videoId = videoId;
+
+                // Create placeholder if needed
+                const cell = document.getElementById(`cell-${this.id}`);
+                if (!cell) return;
+
+                // Remove existing if any (double safety)
+                const existing = document.getElementById(`player-${this.id}`);
+                if (existing) existing.remove();
+
+                const placeholder = document.createElement('div');
+                placeholder.id = `player-${this.id}`;
+                placeholder.className = 'player-frame';
+
+                // Instert before overlay
+                const overlay = cell.querySelector('.selection-overlay');
+                cell.insertBefore(placeholder, overlay);
+
+                this.player = new YT.Player(`player-${this.id}`, {
+                    height: '100%',
+                    width: '100%',
+                    videoId: videoId,
+                    playerVars: {
+                        autoplay: 1,
+                        controls: 0,
+                        disablekb: 1,
+                        fs: 0,
+                        modestbranding: 1,
+                        iv_load_policy: 3,
+                        mute: 1,
+                        playsinline: 1
+                    },
+                    events: {
+                        onReady: this.onPlayerReady,
+                        onStateChange: this.onPlayerStateChange,
+                        onError: (e) => console.warn(`Player ${this.id} Error:`, e) // Review #7
+                    }
+                });
+            }
+
+            destroyPlayer() {
+                this.stopMonitor();
+                if (this.player && typeof this.player.destroy === 'function') {
+                    try {
+                        this.player.destroy();
+                    } catch (e) {
+                        console.warn(`Error destroying player ${this.id}:`, e);
+                    }
+                }
+                this.player = null;
+                const el = document.getElementById(`player-${this.id}`);
+                if (el) el.remove();
+            }
+
+            onPlayerReady(event) {
+                // Apply volume
+                const vol = parseInt(this.controls.volume.value);
+                if (vol > 0) {
+                    event.target.unMute();
+                    event.target.setVolume(vol);
+                } else {
+                    event.target.mute();
+                }
+
+                // Review #6: Check duration
+                const duration = event.target.getDuration();
+                const currentEnd = parseTime(this.controls.end.value);
+                if (duration > 0 && currentEnd > duration) {
+                    // console.log(`Auto-adjusting end time for Track ${this.id} to ${duration}`);
+                    // Optional: update UI end time? 
+                    // Let's keep UI as user set, but respect duration in loop logic if needed.
+                    // For now, just logging.
+                }
+            }
+
+            onPlayerStateChange(event) {
+                if (event.data === YT.PlayerState.PLAYING) {
+                    this.startMonitor();
+                } else {
+                    this.stopMonitor();
+                }
+            }
+
+            startMonitor() {
+                if (!this.isMonitoring) {
+                    this.isMonitoring = true;
+                    this.loopMonitor();
+                }
+            }
+
+            stopMonitor() {
+                this.isMonitoring = false;
+                if (this.rafId) {
+                    cancelAnimationFrame(this.rafId);
+                    this.rafId = null;
+                }
+            }
+
+            loopMonitor() {
+                if (!this.isMonitoring || !this.player || typeof this.player.getCurrentTime !== 'function') return;
+
+                // High precision loop check using requestAnimationFrame (Review #1)
+                try {
+                    const currentTime = this.player.getCurrentTime();
+                    const startRaw = this.controls.start.value;
+                    const endRaw = this.controls.end.value;
+
+                    const start = parseTime(startRaw) || 0;
+                    let end = parseTime(endRaw) || 10;
+
+                    // Basic sanity check
+                    if (end <= start) end = start + 10;
+
+                    if (currentTime >= end) {
+                        // Seeking (Review #1: smooth loop)
+                        this.player.seekTo(start, true);
+                    }
+                } catch (e) {
+                    console.warn('Loop Monitor Error:', e);
+                }
+
+                this.rafId = requestAnimationFrame(this.loopMonitor);
+            }
+
+            setVolume(val) {
+                if (!this.player || typeof this.player.setVolume !== 'function') return;
+                const v = parseInt(val);
+                if (v > 0) {
+                    this.player.unMute();
+                    this.player.setVolume(v);
+                } else {
+                    this.player.mute();
+                }
+            }
+
+            play() {
+                if (this.player && typeof this.player.playVideo === 'function') {
+                    this.player.playVideo();
+                }
+            }
+
+            pause() {
+                if (this.player && typeof this.player.pauseVideo === 'function') {
+                    this.player.pauseVideo();
+                }
+            }
+        }
+
+        // --- Main Logic ---
 
         function init(layoutKey = '16') {
             currentLayoutKey = layoutKey;
             const config = LAYOUTS[layoutKey];
-            customSpans = {}; // Reset custom merges
+            customSpans = {};
             selectedCellId = null;
             renderGrid(config);
         }
@@ -403,17 +591,14 @@
 
             gridContainer.innerHTML = '';
             controlsContainer.innerHTML = '';
-            inputCache = [];
 
-            // Destroy players
-            players.forEach(p => { try { p.destroy(); } catch (e) { } });
-            players.clear();
-            loops.forEach(l => clearInterval(l));
-            loops.clear();
+            // Cleanup existing tracks
+            tracks.forEach(t => t.destroyPlayer());
+            tracks.clear();
 
             gridContainer.style.gridTemplateColumns = `repeat(${config.cols}, 1fr)`;
 
-            // Merge logic: Combine Config + Custom
+            // Merge logic
             const activeSpans = { ... (config.spans || {}), ...customSpans };
             const activeSkips = [... (config.skips || [])];
 
@@ -441,21 +626,11 @@
             for (let i = 0; i < totalCells; i++) {
                 if (activeSkips.includes(i)) continue;
 
+                // Create Grid Cell
                 const cell = document.createElement('div');
                 cell.className = 'track-cell';
                 cell.dataset.rawId = i;
-
-                // Select event (delegated in cell for simplicity)
-                cell.onclick = (e) => {
-                    // Ignore clicks on player if API captures them? 
-                    // Actually overlays might block.
-                    // Let's use overlay click logic if needed, but here simple click wrapper works.
-                    // But if iframe is on top, click won't bubble unless pointer-events:none on iframe.
-                    // We need iframe to be interactive? Typically yes.
-                    // Solution: Click on track-number-overlay to select? Or a border area.
-                    // Assuming clicks bubble from overlay.
-                    selectCellForMerge(i, cell);
-                };
+                cell.onclick = () => selectCellForMerge(i, cell);
 
                 if (activeSpans[i]) {
                     const span = activeSpans[i];
@@ -467,13 +642,12 @@
                 cell.id = `cell-${currentId}`;
                 cell.innerHTML = `
                     <div class="track-number-overlay" style="pointer-events:none;">#${currentId + 1}</div>
-                    <div id="player-${currentId}" class="player-frame"></div>
-                    <!-- Selection border helper -->
+                    <!-- Player will be injected here -->
                     <div class="selection-overlay" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;border:3px solid transparent;z-index:20;"></div>
                 `;
                 gridContainer.appendChild(cell);
 
-                // Control
+                // Create Controls
                 const row = document.createElement('div');
                 row.className = 'control-row';
                 row.innerHTML = `
@@ -487,25 +661,26 @@
                 `;
                 controlsContainer.appendChild(row);
 
-                inputCache[currentId] = {
+                // Initialize Track Object
+                const controls = {
                     url: row.querySelector('.url-input'),
                     start: row.querySelector('.start-time'),
                     end: row.querySelector('.end-time'),
                     volume: row.querySelector('.volume-slider')
                 };
 
+                const track = new Track(currentId, controls);
+                tracks.set(currentId, track);
+
                 playerIndex++;
             }
-            currentPlayersCount = playerIndex;
             selectedCellId = null;
         }
 
         function selectCellForMerge(rawId, element) {
-            // Visual feedback via .selection-overlay
             document.querySelectorAll('.selection-overlay').forEach(el => el.style.borderColor = 'transparent');
             const overlay = element.querySelector('.selection-overlay');
             if (overlay) overlay.style.borderColor = '#0d6efd';
-
             selectedCellId = rawId;
         }
 
@@ -514,8 +689,6 @@
                 alert('先に結合したいセルの左上をクリックして選択してください。');
                 return;
             }
-
-            // Check boundary
             const config = LAYOUTS[currentLayoutKey];
             const row = Math.floor(selectedCellId / config.cols);
             const col = selectedCellId % config.cols;
@@ -525,98 +698,34 @@
                 return;
             }
 
-            // Register merge
             customSpans[selectedCellId] = { r: 2, c: 2 };
-
-            // Re-render
             renderGrid(config);
         });
 
-        // Initial Load
+        // Initialize
         init('16');
 
         document.getElementById('layout-select').addEventListener('change', (e) => {
             init(e.target.value);
         });
 
-        function onYouTubeIframeAPIReady() { }
-
-        function createPlayer(index, videoId) {
-            if (players.has(index)) {
-                try { players.get(index).destroy(); } catch (e) { }
-                players.delete(index);
-                if (loops.has(index)) { clearInterval(loops.get(index)); loops.delete(index); }
-            }
-
-            const cell = document.getElementById(`cell-${index}`);
-            let placeholder = document.getElementById(`player-${index}`);
-
-            if (!placeholder && cell) {
-                placeholder = document.createElement('div');
-                placeholder.id = `player-${index}`;
-                placeholder.className = 'player-frame';
-                // Insert before selection overlay to keep overlay on top
-                const overlay = cell.querySelector('.selection-overlay');
-                cell.insertBefore(placeholder, overlay);
-            }
-
-            if (!placeholder) return;
-
-            const p = new YT.Player(`player-${index}`, {
-                height: '100%',
-                width: '100%',
-                videoId: videoId,
-                playerVars: { autoplay: 1, controls: 0, disablekb: 1, fs: 0, modestbranding: 1, iv_load_policy: 3, mute: 1, playsinline: 1 },
-                events: {
-                    onReady: (e) => {
-                        const volSlider = inputCache[index]?.volume;
-                        if (volSlider) {
-                            const vol = parseInt(volSlider.value);
-                            if (vol > 0) { e.target.unMute(); e.target.setVolume(vol); }
-                            else { e.target.mute(); }
-                        }
-                    },
-                    onStateChange: (e) => onPlayerStateChange(e, index)
-                }
-            });
-            players.set(index, p);
+        function onYouTubeIframeAPIReady() {
+            // API Ready
         }
 
-        function onPlayerStateChange(event, index) {
-            if (event.data === YT.PlayerState.PLAYING) {
-                if (loops.has(index)) clearInterval(loops.get(index));
-                loops.set(index, setInterval(() => checkLoop(index), 100));
-            } else {
-                if (loops.has(index)) { clearInterval(loops.get(index)); loops.delete(index); }
-            }
-        }
-
-        function checkLoop(index) {
-            const player = players.get(index);
-            if (!player || typeof player.getCurrentTime !== 'function') return;
-
-            const inputs = inputCache[index];
-            if (!inputs) return;
-
-            const start = parseTime(inputs.start.value) || 0;
-            const end = parseTime(inputs.end.value) || 10;
-            if (end <= start) return;
-
-            try {
-                if (player.getCurrentTime() >= end) {
-                    player.seekTo(start, true);
-                }
-            } catch (e) { }
-        }
-
-        // Delegated listeners
+        // Global Event Listeners (Delegation)
         document.addEventListener('click', (e) => {
             if (e.target.classList.contains('load-btn')) {
                 const id = parseInt(e.target.dataset.id);
-                if (inputCache[id]) {
-                    const url = inputCache[id].url.value;
+                const track = tracks.get(id);
+                if (track) {
+                    const url = track.controls.url.value;
                     const videoId = extractVideoId(url);
-                    if (videoId) createPlayer(id, videoId);
+                    if (videoId) {
+                        track.loadVideo(videoId);
+                    } else {
+                        alert('無効なURLです');
+                    }
                 }
             }
         });
@@ -624,15 +733,25 @@
         document.addEventListener('input', (e) => {
             if (e.target.classList.contains('volume-slider')) {
                 const id = parseInt(e.target.dataset.id);
-                const player = players.get(id);
-                const vol = parseInt(e.target.value);
-                if (player && typeof player.setVolume === 'function') {
-                    if (vol > 0) { player.unMute(); player.setVolume(vol); }
-                    else { player.mute(); }
+                const track = tracks.get(id);
+                if (track) {
+                    track.setVolume(e.target.value);
                 }
             }
         });
 
+        document.addEventListener('keydown', (e) => {
+            if (e.target.classList.contains('url-input') && e.key === 'Enter') {
+                const id = parseInt(e.target.dataset.id);
+                const track = tracks.get(id);
+                if (track) {
+                    const videoId = extractVideoId(e.target.value);
+                    if (videoId) track.loadVideo(videoId);
+                }
+            }
+        });
+
+        // Master Controls
         document.getElementById('btn-apply-all').addEventListener('click', () => {
             const url = document.getElementById('master-url').value;
             const start = document.getElementById('master-start').value;
@@ -640,53 +759,46 @@
             const vol = document.getElementById('master-volume').value;
             const videoId = extractVideoId(url);
 
-            for (let i = 0; i < currentPlayersCount; i++) {
-                if (!inputCache[i]) continue;
-                if (url) inputCache[i].url.value = url;
-                inputCache[i].start.value = start;
-                inputCache[i].end.value = end;
-                inputCache[i].volume.value = vol;
+            tracks.forEach((track, id) => {
+                if (url) track.controls.url.value = url;
+                track.controls.start.value = start;
+                track.controls.end.value = end;
+                track.controls.volume.value = vol;
 
-                const player = players.get(i);
-                if (player && typeof player.setVolume === 'function') {
-                    const v = parseInt(vol);
-                    if (v > 0) { player.unMute(); player.setVolume(v); }
-                    else { player.mute(); }
-                }
+                track.setVolume(vol);
 
                 if (videoId) {
-                    setTimeout(() => createPlayer(i, videoId), i * 150);
+                    // Stagger loading slightly to avoid browser lag
+                    setTimeout(() => track.loadVideo(videoId), id * 150);
                 }
-            }
+            });
         });
 
         document.getElementById('btn-play-all').addEventListener('click', () => {
-            players.forEach(p => p.playVideo());
+            tracks.forEach(t => t.play());
         });
 
         document.getElementById('btn-pause-all').addEventListener('click', () => {
-            players.forEach(p => p.pauseVideo());
+            tracks.forEach(t => t.pause());
         });
 
         // Export Function
         document.getElementById('btn-export').addEventListener('click', () => {
-            const tracks = [];
-            for (let i = 0; i < currentPlayersCount; i++) {
-                if (inputCache[i]) {
-                    tracks.push({
-                        id: i,
-                        url: inputCache[i].url.value,
-                        start: inputCache[i].start.value,
-                        end: inputCache[i].end.value,
-                        volume: inputCache[i].volume.value
-                    });
-                }
-            }
+            const tracksData = [];
+            tracks.forEach((track, id) => {
+                tracksData.push({
+                    id: id,
+                    url: track.controls.url.value,
+                    start: track.controls.start.value,
+                    end: track.controls.end.value,
+                    volume: track.controls.volume.value
+                });
+            });
 
             const data = {
                 layout: currentLayoutKey,
                 customSpans: customSpans,
-                tracks: tracks,
+                tracks: tracksData,
                 timestamp: new Date().toISOString()
             };
 
@@ -718,6 +830,7 @@
                     applyImportData(data);
                 } catch (err) {
                     alert('JSONの読み込みに失敗しました: ' + err);
+                    console.error(err); // Review #7
                 }
             };
             reader.readAsText(file);
@@ -730,43 +843,28 @@
                 return;
             }
 
-            // 1. Set Layout
             document.getElementById('layout-select').value = data.layout;
-
-            // 2. Restore Custom Spans
             customSpans = data.customSpans || {};
 
-            // 3. Init Grid (This resets inputs, so do it before setting values)
             init(data.layout);
 
-            // 4. Restore Track Settings
             if (Array.isArray(data.tracks)) {
-                data.tracks.forEach(track => {
-                    const idx = track.id;
-                    if (inputCache[idx]) {
-                        inputCache[idx].url.value = track.url || '';
-                        inputCache[idx].start.value = track.start || '0.00';
-                        inputCache[idx].end.value = track.end || '10.00';
-                        inputCache[idx].volume.value = track.volume || '0';
+                data.tracks.forEach(tData => {
+                    const track = tracks.get(tData.id);
+                    if (track) {
+                        track.controls.url.value = tData.url || '';
+                        track.controls.start.value = tData.start || '0.00';
+                        track.controls.end.value = tData.end || '10.00';
+                        track.controls.volume.value = tData.volume || '0';
 
-                        // Auto-load if URL exists
-                        const videoId = extractVideoId(track.url);
+                        const videoId = extractVideoId(tData.url);
                         if (videoId) {
-                            // Delay slightly to ensure DOM is ready? Not strictly needed but safe
-                            createPlayer(idx, videoId);
+                            setTimeout(() => track.loadVideo(videoId), tData.id * 50);
                         }
                     }
                 });
             }
         }
-
-        document.addEventListener('keydown', (e) => {
-            if (e.target.classList.contains('url-input') && e.key === 'Enter') {
-                const id = parseInt(e.target.dataset.id);
-                const videoId = extractVideoId(e.target.value);
-                if (videoId) createPlayer(id, videoId);
-            }
-        });
     </script>
 </body>
 
