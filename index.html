@@ -265,6 +265,10 @@
                 <div style="width:10px;"></div>
                 <button id="btn-play-all" class="btn btn-success btn-small">Play All</button>
                 <button id="btn-pause-all" class="btn btn-secondary btn-small">Pause All</button>
+                <div style="width:10px;"></div>
+                <button id="btn-export" class="btn btn-secondary btn-small">Export JSON</button>
+                <button id="btn-import" class="btn btn-secondary btn-small">Import JSON</button>
+                <input type="file" id="file-import" accept=".json" style="display: none;">
             </div>
         </header>
 
@@ -663,6 +667,98 @@
         document.getElementById('btn-pause-all').addEventListener('click', () => {
             players.forEach(p => p.pauseVideo());
         });
+
+        // Export Function
+        document.getElementById('btn-export').addEventListener('click', () => {
+            const tracks = [];
+            for (let i = 0; i < currentPlayersCount; i++) {
+                if (inputCache[i]) {
+                    tracks.push({
+                        id: i,
+                        url: inputCache[i].url.value,
+                        start: inputCache[i].start.value,
+                        end: inputCache[i].end.value,
+                        volume: inputCache[i].volume.value
+                    });
+                }
+            }
+
+            const data = {
+                layout: currentLayoutKey,
+                customSpans: customSpans,
+                tracks: tracks,
+                timestamp: new Date().toISOString()
+            };
+
+            const jsonStr = JSON.stringify(data, null, 2);
+            const blob = new Blob([jsonStr], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `yukic_grid_${Date.now()}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        });
+
+        // Import Function
+        document.getElementById('btn-import').addEventListener('click', () => {
+            document.getElementById('file-import').click();
+        });
+
+        document.getElementById('file-import').addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                try {
+                    const data = JSON.parse(event.target.result);
+                    applyImportData(data);
+                } catch (err) {
+                    alert('JSONの読み込みに失敗しました: ' + err);
+                }
+            };
+            reader.readAsText(file);
+            e.target.value = ''; // Reset
+        });
+
+        function applyImportData(data) {
+            if (!data.layout) {
+                alert('無効なJSONデータ形式です (layout不足)');
+                return;
+            }
+
+            // 1. Set Layout
+            document.getElementById('layout-select').value = data.layout;
+
+            // 2. Restore Custom Spans
+            customSpans = data.customSpans || {};
+
+            // 3. Init Grid (This resets inputs, so do it before setting values)
+            init(data.layout);
+
+            // 4. Restore Track Settings
+            if (Array.isArray(data.tracks)) {
+                data.tracks.forEach(track => {
+                    const idx = track.id;
+                    if (inputCache[idx]) {
+                        inputCache[idx].url.value = track.url || '';
+                        inputCache[idx].start.value = track.start || '0.00';
+                        inputCache[idx].end.value = track.end || '10.00';
+                        inputCache[idx].volume.value = track.volume || '0';
+
+                        // Auto-load if URL exists
+                        const videoId = extractVideoId(track.url);
+                        if (videoId) {
+                            // Delay slightly to ensure DOM is ready? Not strictly needed but safe
+                            createPlayer(idx, videoId);
+                        }
+                    }
+                });
+            }
+        }
 
         document.addEventListener('keydown', (e) => {
             if (e.target.classList.contains('url-input') && e.key === 'Enter') {
